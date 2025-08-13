@@ -1,3 +1,20 @@
+/*
+  文件概览：交易构建与执行工具（TxBuilder）
+
+  作用：
+  - 为各业务模块（CLMM、Liquidity、TradeV2 等）提供统一的交易构建与执行能力。
+  - 支持 Legacy 与 V0 版本交易的构建、分片（超长拆分）、签名与发送；支持多笔交易（批量或串行）执行。
+  - 集成计算预算（compute budget）与小费（tip）指令的注入；根据网络费况自动估算预算费率。
+  - 支持 Address Lookup Table（ALT）缓存与拼装，优化 V0 交易体积。
+
+  关键特性：
+  - addInstruction：按类型收集指令、尾指令、签名者、指令类型与 ALT 地址。
+  - addCustomComputeBudget / calComputeBudget：手动或自动注入 compute budget。
+  - addTipInstruction：添加小费转账指令。
+  - build / buildV0 / versionBuild：返回可执行（execute）的构建结果。
+  - buildMultiTx / buildV0MultiTx / sizeCheckBuild(V0)：按大小拆分或多笔组装并执行。
+*/
+
 import {
   Commitment,
   Connection,
@@ -28,6 +45,9 @@ import {
   printSimulate,
 } from "./txUtils";
 
+/**
+ * Solana 网络费信息（来自 solanacompass）
+ */
 interface SolanaFeeInfo {
   min: number;
   max: number;
@@ -38,12 +58,22 @@ interface SolanaFeeInfo {
   avgCuPerBlock: number;
   blockspaceUsageRatio: number;
 }
+/**
+ * 不同时间窗口（1/5/15 分钟）的费况数据
+ */
 type SolanaFeeInfoJson = {
   "1": SolanaFeeInfo;
   "5": SolanaFeeInfo;
   "15": SolanaFeeInfo;
 };
 
+/**
+ * 交易执行参数
+ * - skipPreflight：是否跳过模拟
+ * - recentBlockHash：覆盖使用的区块哈希
+ * - sendAndConfirm：是否在发送后等待确认
+ * - notSendToRpc：仅返回已签名交易但不广播
+ */
 interface ExecuteParams {
   skipPreflight?: boolean;
   recentBlockHash?: string;
@@ -51,6 +81,17 @@ interface ExecuteParams {
   notSendToRpc?: boolean;
 }
 
+/**
+ * TxBuilder 初始化参数
+ * - connection：RPC 连接
+ * - feePayer：费用支付者
+ * - cluster：网络环境（mainnet/devnet 等）
+ * - owner：可选的用户（用于签名）
+ * - blockhashCommitment：获取区块哈希时的承诺等级
+ * - loopMultiTxStatus：多笔交易串行时是否轮询状态
+ * - api：可选 API 客户端（保留扩展）
+ * - signAllTransactions：批量签名函数（钱包适配）
+ */
 interface TxBuilderInit {
   connection: Connection;
   feePayer: PublicKey;
@@ -62,6 +103,14 @@ interface TxBuilderInit {
   signAllTransactions?: SignAllTransactions;
 }
 
+/**
+ * 往 TxBuilder 中添加指令的数据结构
+ * - instructions：普通指令
+ * - endInstructions：尾部指令（如 close、tip）
+ * - lookupTableAddress：V0 用到的 ALT 地址列表
+ * - signers：额外签名者
+ * - instructionTypes / endInstructionTypes：指令类型标记（仅用于记录/调试）
+ */
 export interface AddInstructionParam {
   addresses?: Record<string, PublicKey>;
   instructions?: TransactionInstruction[];
@@ -72,6 +121,9 @@ export interface AddInstructionParam {
   endInstructionTypes?: string[];
 }
 
+/**
+ * Legacy 交易构建结果
+ */
 export interface TxBuildData<T = Record<string, any>> {
   builder: TxBuilder;
   transaction: Transaction;
@@ -81,6 +133,10 @@ export interface TxBuildData<T = Record<string, any>> {
   extInfo: T;
 }
 
+/**
+ * V0 交易构建结果
+ * - buildProps：包含 ALT 缓存与地址、forerunCreate 等构建上下文
+ */
 export interface TxV0BuildData<T = Record<string, any>> extends Omit<TxBuildData<T>, "transaction" | "execute"> {
   builder: TxBuilder;
   transaction: VersionedTransaction;
@@ -96,11 +152,20 @@ type TxUpdateParams = {
   status: "success" | "error" | "sent";
   signedTx: Transaction | VersionedTransaction;
 };
+/**
+ * 多交易执行参数
+ * - sequentially：是否串行执行
+ * - skipTxCount：跳过前 N 笔（已成功的场景）
+ * - onTxUpdate：回调每笔交易状态（sent/success/error）
+ */
 export interface MultiTxExecuteParam extends ExecuteParams {
   sequentially: boolean;
   skipTxCount?: number;
   onTxUpdate?: (completeTxs: TxUpdateParams[]) => void;
 }
+/**
+ * Legacy 批量交易构建结果
+ */
 export interface MultiTxBuildData<T = Record<string, any>> {
   builder: TxBuilder;
   transactions: Transaction[];
@@ -110,6 +175,9 @@ export interface MultiTxBuildData<T = Record<string, any>> {
   extInfo: T;
 }
 
+/**
+ * V0 批量交易构建结果
+ */
 export interface MultiTxV0BuildData<T = Record<string, any>>
   extends Omit<MultiTxBuildData<T>, "transactions" | "execute"> {
   builder: TxBuilder;
@@ -121,31 +189,51 @@ export interface MultiTxV0BuildData<T = Record<string, any>>
   execute: (executeParams?: MultiTxExecuteParam) => Promise<{ txIds: string[]; signedTxs: VersionedTransaction[] }>;
 }
 
+/** 条件类型：按版本返回 Legacy 或 V0 的批量交易类型 */
 export type MakeMultiTxData<T = TxVersion.LEGACY, O = Record<string, any>> = T extends TxVersion.LEGACY
   ? MultiTxBuildData<O>
   : MultiTxV0BuildData<O>;
 
+/** 条件类型：按版本返回 Legacy 或 V0 的单笔交易类型 */
 export type MakeTxData<T = TxVersion.LEGACY, O = Record<string, any>> = T extends TxVersion.LEGACY
   ? TxBuildData<O>
   : TxV0BuildData<O>;
 
+/** 多笔串行轮询间隔（毫秒） */
 const LOOP_INTERVAL = 2000;
 
+/**
+ * 交易构建器：封装指令收集、预算/小费注入、签名与发送、V0/Legacy 构建与分片等能力。
+ */
 export class TxBuilder {
+  /** RPC 连接 */
   private connection: Connection;
+  /** 可选的 owner（若为 Keypair 可本地签名） */
   private owner?: Owner;
+  /** 普通指令集合 */
   private instructions: TransactionInstruction[] = [];
+  /** 尾部指令集合（如 close/tip） */
   private endInstructions: TransactionInstruction[] = [];
+  /** ALT 地址集合（V0） */
   private lookupTableAddress: string[] = [];
+  /** 额外签名者集合 */
   private signers: Signer[] = [];
+  /** 指令类型标记（调试/记录） */
   private instructionTypes: string[] = [];
+  /** 尾部指令类型标记（调试/记录） */
   private endInstructionTypes: string[] = [];
+  /** 费用支付者 */
   private feePayer: PublicKey;
+  /** 集群环境 */
   private cluster: Cluster;
+  /** 批量签名器（适配钱包） */
   private signAllTransactions?: SignAllTransactions;
+  /** 获取区块哈希时的承诺等级 */
   private blockhashCommitment?: Commitment;
+  /** 多笔交易串行时，是否轮询交易状态（辅助前端展示） */
   private loopMultiTxStatus: boolean;
 
+  /** 构造函数：注入连接、费支付者、owner、签名器等上下文 */
   constructor(params: TxBuilderInit) {
     this.connection = params.connection;
     this.feePayer = params.feePayer;
@@ -156,6 +244,7 @@ export class TxBuilder {
     this.loopMultiTxStatus = !!params.loopMultiTxStatus;
   }
 
+  /** 返回已收集的所有指令、签名者与 ALT 地址（便于复用或外层拼装） */
   get AllTxData(): {
     instructions: TransactionInstruction[];
     endInstructions: TransactionInstruction[];
@@ -174,10 +263,16 @@ export class TxBuilder {
     };
   }
 
+  /** 返回所有需加入交易的指令（按顺序拼接普通指令与尾部指令） */
   get allInstructions(): TransactionInstruction[] {
     return [...this.instructions, ...this.endInstructions];
   }
 
+  /**
+   * 自动从 solanacompass 拉取网络费用，估算 compute budget：
+   * - units：默认 600,000
+   * - microLamports：按平均费率换算并限幅到 25,000
+   */
   public async getComputeBudgetConfig(): Promise<ComputeBudgetConfig | undefined> {
     const json = (
       await axios.get<SolanaFeeInfoJson>(`https://solanacompass.com/api/fees?cacheFreshTime=${5 * 60 * 1000}`)
@@ -190,6 +285,7 @@ export class TxBuilder {
     };
   }
 
+  /** 手动注入 compute budget 指令（存在则插入队首） */
   public addCustomComputeBudget(config?: ComputeBudgetConfig): boolean {
     if (config) {
       const { instructions, instructionTypes } = addComputeBudget(config);
@@ -200,6 +296,7 @@ export class TxBuilder {
     return false;
   }
 
+  /** 添加小费（tip）转账指令到尾部 */
   public addTipInstruction(tipConfig?: TxTipConfig): boolean {
     if (tipConfig) {
       this.endInstructions.push(
@@ -215,6 +312,11 @@ export class TxBuilder {
     return false;
   }
 
+  /**
+   * 计算并注入 compute budget：
+   * - 若传入 config 使用之，否则自动获取网络费况估算
+   * - 若失败则退化为拼入 defaultIns（如模块自带的默认预算）
+   */
   public async calComputeBudget({
     config: propConfig,
     defaultIns,
@@ -231,6 +333,9 @@ export class TxBuilder {
     }
   }
 
+  /**
+   * 收集一组指令到构建器：普通/尾部指令、签名者、类型标记与 ALT 地址。
+   */
   public addInstruction({
     instructions = [],
     endInstructions = [],
@@ -248,6 +353,7 @@ export class TxBuilder {
     return this;
   }
 
+  /** 按指定版本（Legacy/V0）构建单笔交易 */
   public async versionBuild<O = Record<string, any>>({
     txVersion,
     extInfo,
@@ -259,6 +365,7 @@ export class TxBuilder {
     return this.build<O>(extInfo) as MakeTxData<TxVersion.LEGACY, O>;
   }
 
+  /** 构建 Legacy 交易并返回可执行对象（execute） */
   public build<O = Record<string, any>>(extInfo?: O): MakeTxData<TxVersion.LEGACY, O> {
     const transaction = new Transaction();
     if (this.allInstructions.length) transaction.add(...this.allInstructions);
@@ -317,6 +424,7 @@ export class TxBuilder {
     };
   }
 
+  /** 构建多笔 Legacy 交易（可串行/并行执行），支持拼入额外预构建交易 */
   public buildMultiTx<T = Record<string, any>>(params: {
     extraPreBuildData?: MakeTxData<TxVersion.LEGACY>[];
     extInfo?: T;
@@ -388,7 +496,7 @@ export class TxBuilder {
         }
 
         if (this.signAllTransactions) {
-          const partialSignedTxs = allTransactions.map((tx, idx) => {
+          const partialSignedTxs = allTransactions.map((tx, idx): Transaction => {
             tx.recentBlockhash = recentBlockHash;
             if (allSigners[idx].length) tx.sign(...allSigners[idx]);
             return tx;
@@ -482,6 +590,7 @@ export class TxBuilder {
     };
   }
 
+  /** 按指定版本构建多笔交易（Legacy/V0） */
   public async versionMultiBuild<T extends TxVersion, O = Record<string, any>>({
     extraPreBuildData,
     txVersion,
@@ -502,6 +611,7 @@ export class TxBuilder {
     }) as MakeMultiTxData<T, O>;
   }
 
+  /** 构建单笔 V0 交易：自动拼装 ALT、支持 forerunCreate 与外部 recentBlockhash */
   public async buildV0<O = Record<string, any>>(
     props?: O & {
       lookupTableCache?: CacheLTA;
@@ -585,6 +695,7 @@ export class TxBuilder {
     };
   }
 
+  /** 构建多笔 V0 交易：整合 ALT、签名与执行（支持串行） */
   public async buildV0MultiTx<T = Record<string, any>>(params: {
     extraPreBuildData?: MakeTxData<TxVersion.V0>[];
     buildProps?: T & {
@@ -739,6 +850,11 @@ export class TxBuilder {
     };
   }
 
+  /**
+   * 将指令按大小限制切分为多笔 Legacy 交易：
+   * - computeBudgetConfig：可选统一的预算指令
+   * - splitIns：建议拆分点（遇到该指令则强制换新交易）
+   */
   public async sizeCheckBuild(
     props?: Record<string, any> & { computeBudgetConfig?: ComputeBudgetConfig; splitIns?: TransactionInstruction[] },
   ): Promise<MultiTxBuildData> {
@@ -987,6 +1103,12 @@ export class TxBuilder {
     };
   }
 
+  /**
+   * 将指令按大小限制切分为多笔 V0 交易：
+   * - computeBudgetConfig：可选统一的预算指令
+   * - lookupTableCache / lookupTableAddress：ALT 缓存与地址
+   * - splitIns：建议拆分点
+   */
   public async sizeCheckBuildV0(
     props?: Record<string, any> & {
       computeBudgetConfig?: ComputeBudgetConfig;

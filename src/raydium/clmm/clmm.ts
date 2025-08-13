@@ -1,3 +1,17 @@
+/*
+  文件概览：集中式流动性（CLMM）模块
+
+  作用：
+  - 封装 Raydium CLMM 的核心交互：创建池、开/增/减/关仓位、奖励初始化/发放/领取、交换等。
+  - 将底层指令组装能力（ClmmInstrument）对外暴露为易用的方法，并内置账户准备（ATA/WSOL）与预算/小费指令。
+  - 提供从 RPC/API 拉取与计算池信息的能力（含 tick 数组与扩展配置解析）。
+
+  设计要点：
+  - 所有链交互均返回可加入交易构建器的结构（MakeTxData/MakeMultiTxData），便于上层拼装与发送。
+  - 与 `Account` 模块联动，自动处理用户 Token 账户（ATA/WSOL 包装与可选关闭）。
+  - 与 `Api` 协作，按需拉取池键值（poolKeys）与运行时配置信息。
+*/
+
 import { PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
 import Decimal from "decimal.js";
@@ -59,7 +73,7 @@ import {
   SetRewardsParams,
   ClmmLockAddress,
 } from "./type";
-import { MAX_SQRT_PRICE_X64, MIN_SQRT_PRICE_X64, mockV3CreatePoolInfo, ZERO } from "./utils/constants";
+import { MAX_SQRT_PRICE_X64, MIN_SQRT_PRICE_X64, mockV3CreatePoolInfo } from "./utils/constants";
 import { MathUtil, SqrtPriceMath } from "./utils/math";
 import {
   getPdaOperationAccount,
@@ -73,15 +87,27 @@ import {
 import { PoolUtils, clmmComputeInfoToApiInfo } from "./utils/pool";
 import { TickUtils } from "./utils/tick";
 
+/**
+ * CLMM 主类：提供集中式流动性相关的高层 API。
+ */
 export class Clmm extends ModuleBase {
+  /**
+   * 构造函数：仅透传上层 `scope`、`moduleName` 等上下文。
+   */
   constructor(params: ModuleBaseProps) {
     super(params);
   }
 
+  /**
+   * 获取指定池的 `ClmmKeys`（程序/金库/观测账户等关键 PDA）。
+   */
   public async getClmmPoolKeys(poolId: string): Promise<ClmmKeys> {
     return ((await this.scope.api.fetchPoolKeysById({ idList: [poolId] })) as ClmmKeys[])[0];
   }
 
+  /**
+   * 创建 CLMM 池：返回交易数据与模拟池信息，支持可选预创建/预算/小费配置。
+   */
   public async createPool<T extends TxVersion>(
     props: CreateConcentratedPool<T>,
   ): Promise<MakeTxData<T, { mockPoolInfo: ApiV3PoolInfoConcentratedItem; address: ClmmKeys }>> {
@@ -195,6 +221,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, { mockPoolInfo: ApiV3PoolInfoConcentratedItem; address: ClmmKeys }>>;
   }
 
+  /**
+   * 以基础数量开仓：以某一侧 Token 为基准提供资金，SDK 自动完成账户准备与指令组装。
+   */
   public async openPositionFromBase<T extends TxVersion>({
     poolInfo,
     poolKeys: propPoolKeys,
@@ -304,6 +333,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, OpenPositionFromBaseExtInfo>>;
   }
 
+  /**
+   * 以流动性值开仓：指定目标流动性与边界 tick，SDK 自动完成账户准备与指令组装。
+   */
   public async openPositionFromLiquidity<T extends TxVersion>({
     poolInfo,
     poolKeys: propPoolKeys,
@@ -406,6 +438,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, OpenPositionFromLiquidityExtInfo>>;
   }
 
+  /**
+   * 以流动性值加仓：在已有仓位上追加流动性，自动处理用户账户准备与 Token-2022 兼容。
+   */
   public async increasePositionFromLiquidity<T extends TxVersion>(
     props: IncreasePositionFromLiquidity<T>,
   ): Promise<MakeTxData<T, ManipulateLiquidityExtInfo>> {
@@ -498,6 +533,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, ManipulateLiquidityExtInfo>>;
   }
 
+  /**
+   * 以基础数量加仓：以某一侧 Token 为基准追加资金。
+   */
   public async increasePositionFromBase<T extends TxVersion>(
     props: IncreasePositionFromBase<T>,
   ): Promise<MakeTxData<T, ManipulateLiquidityExtInfo>> {
@@ -590,6 +628,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, ManipulateLiquidityExtInfo>>;
   }
 
+  /**
+   * 减少仓位流动性：可选最小接收约束，支持随减仓附带关仓处理。
+   */
   public async decreaseLiquidity<T extends TxVersion>(
     props: DecreaseLiquidity<T>,
   ): Promise<MakeTxData<T, ManipulateLiquidityExtInfo & Partial<ClosePositionExtInfo>>> {
@@ -736,6 +777,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, ManipulateLiquidityExtInfo>>;
   }
 
+  /**
+   * 锁仓：将仓位 NFT 进行锁定，配合锁仓合约实现收益/解锁逻辑。
+   */
   public async lockPosition<T extends TxVersion>(props: LockPosition<T>): Promise<MakeTxData<ClmmLockAddress>> {
     const {
       programId = CLMM_LOCK_PROGRAM_ID,
@@ -770,6 +814,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<ClmmLockAddress>>;
   }
 
+  /**
+   * 领取锁仓仓位的奖励（V2 指令）。
+   */
   public async harvestLockPosition<T extends TxVersion>(props: HarvestLockPosition<T>): Promise<MakeTxData<T>> {
     const {
       programId = CLMM_LOCK_PROGRAM_ID,
@@ -934,6 +981,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T>>;
   }
 
+  /**
+   * 关闭仓位：回收 NFT 与剩余资产，支持 Token-2022。
+   */
   public async closePosition<T extends TxVersion>({
     poolInfo,
     poolKeys: propPoolKeys,
@@ -970,6 +1020,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, ClosePositionExtInfo>>;
   }
 
+  /**
+   * 初始化单个奖励：设置奖励 mint 与发放时间窗口、速率等。
+   */
   public async initReward<T extends TxVersion>({
     poolInfo,
     ownerInfo,
@@ -1037,6 +1090,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, InitRewardExtInfo>>;
   }
 
+  /**
+   * 批量初始化奖励：同上，但支持多奖励配置并返回各自地址。
+   */
   public async initRewards<T extends TxVersion>({
     poolInfo,
     poolKeys: propPoolKeys,
@@ -1116,6 +1172,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, { address: Record<string, PublicKey> }>>;
   }
 
+  /**
+   * 更新单个奖励参数：适用于调整发放时间/速率。
+   */
   public async setReward<T extends TxVersion>({
     poolInfo,
     ownerInfo,
@@ -1185,6 +1244,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, { address: Record<string, PublicKey> }>>;
   }
 
+  /**
+   * 批量更新奖励参数。
+   */
   public async setRewards<T extends TxVersion>({
     poolInfo,
     poolKeys: propPoolKeys,
@@ -1260,6 +1322,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<T, { address: Record<string, PublicKey> }>>;
   }
 
+  /**
+   * 领取某个奖励 mint 的奖励。
+   */
   public async collectReward<T extends TxVersion>({
     poolInfo,
     ownerInfo,
@@ -1313,6 +1378,9 @@ export class Clmm extends ModuleBase {
     }) as Promise<MakeTxData<{ address: Record<string, PublicKey> }>>;
   }
 
+  /**
+   * 批量领取多种奖励。
+   */
   public async collectRewards({
     poolInfo,
     ownerInfo,
@@ -1370,6 +1438,9 @@ export class Clmm extends ModuleBase {
     return txBuilder.build<{ address: Record<string, PublicKey> }>({ address });
   }
 
+  /**
+   * Swap（Base In）：给定输入数量与最小输出，按需准备账户并组装交换指令。
+   */
   public async swap<T extends TxVersion>({
     poolInfo,
     poolKeys: propPoolKeys,
@@ -1501,6 +1572,9 @@ export class Clmm extends ModuleBase {
     return txBuilder.versionBuild({ txVersion }) as Promise<MakeTxData<T>>;
   }
 
+  /**
+   * Swap（Base Out）：给定目标输出数量与最大可接受输入，按需准备账户并组装交换指令。
+   */
   public async swapBaseOut<T extends TxVersion>({
     poolInfo,
     poolKeys: propPoolKeys,
@@ -1635,6 +1709,9 @@ export class Clmm extends ModuleBase {
     return txBuilder.versionBuild({ txVersion }) as Promise<MakeTxData<T>>;
   }
 
+  /**
+   * 一次性收集多个池/仓位的奖励；若存在锁仓，会优先走锁仓奖励领取。
+   */
   public async harvestAllRewards<T extends TxVersion = TxVersion.LEGACY>({
     allPoolInfo,
     allPositions,
@@ -1894,6 +1971,9 @@ export class Clmm extends ModuleBase {
     return txBuilder.sizeCheckBuild({ computeBudgetConfig }) as Promise<MakeMultiTxData<T>>;
   }
 
+  /**
+   * 读取白名单 mint 列表（来自 Operation 账户）。
+   */
   public async getWhiteListMint({ programId }: { programId: PublicKey }): Promise<PublicKey[]> {
     const accountInfo = await this.scope.connection.getAccountInfo(getPdaOperationAccount(programId).publicKey);
     if (!accountInfo) return [];
@@ -1901,6 +1981,9 @@ export class Clmm extends ModuleBase {
     return whitelistMintsInfo.whitelistMints.filter((i) => !i.equals(PublicKey.default));
   }
 
+  /**
+   * 获取当前钱包所持有的仓位信息列表（通过钱包内的 NFT mint 反查）。
+   */
   public async getOwnerPositionInfo({
     programId = CLMM_PROGRAM_ID,
   }: {
@@ -1965,6 +2048,9 @@ export class Clmm extends ModuleBase {
     return (await this.getRpcClmmPoolInfos({ poolIds: [poolId] }))[String(poolId)];
   }
 
+  /**
+   * 通过 RPC 批量获取 CLMM 池信息，返回解码后的 `PoolInfoLayout` 与当前价格等。
+   */
   public async getRpcClmmPoolInfos({
     poolIds,
     config,
@@ -2001,6 +2087,9 @@ export class Clmm extends ModuleBase {
     return returnData;
   }
 
+  /**
+   * 结合 RPC 池信息与 mint 信息，计算得到可用于交易/报价的池运行时数据（含 tick 数组）。
+   */
   public async getComputeClmmPoolInfos({
     clmmPoolsRpcInfo,
     mintInfos,
@@ -2073,6 +2162,9 @@ export class Clmm extends ModuleBase {
     };
   }
 
+  /**
+   * 直接使用 RPC 数据拼装完整 `poolInfo` 与 `poolKeys`，便于快速构建交易上下文。
+   */
   public async getPoolInfoFromRpc(poolId: string): Promise<{
     poolInfo: ApiV3PoolInfoConcentratedItem;
     poolKeys: ClmmKeys;

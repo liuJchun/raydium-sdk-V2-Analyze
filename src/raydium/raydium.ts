@@ -1,3 +1,21 @@
+/*
+  文件概览：Raydium SDK V2 的核心入口与上下文容器。
+
+  作用：
+  - 统一管理链上连接、用户身份（owner）、日志、API 客户端等全局资源。
+  - 聚合并实例化各业务模块（账户、流动性、CLMM/CPMM、交易、代币、Launchpad、Farm、IDO、市场等）。
+  - 对外提供常用系统能力：链上时间/偏移量、纪元信息、功能可用性、代币列表缓存等。
+  - 提供便捷方法设置/切换 connection、owner、批量签名器等。
+
+  典型用法：
+    const raydium = await Raydium.load({ connection, cluster, owner, ... });
+    // 之后通过 raydium.clmm / raydium.tradeV2 / raydium.liquidity 等模块完成业务操作。
+
+  重要设计：
+  - 轻量缓存：API 返回的 token 列表、Jupiter 列表、链上时间与 epoch 信息等均带缓存时间，避免频繁请求。
+  - 可用性检查：从 API 拉取全局/细分功能的可用状态，用于在应用中动态开关功能。
+*/
+
 import { Connection, Keypair, PublicKey, EpochInfo, Commitment } from "@solana/web3.js";
 import { merge } from "lodash";
 
@@ -21,6 +39,10 @@ import Launchpad from "./launchpad/launchpad";
 import TokenModule from "./token/token";
 import { SignAllTransactions } from "./type";
 
+/**
+ * Raydium 初始化参数（高频外部入参）。
+ * - 包含链上连接、网络、用户、公链时间缓存、批量签名器与 API 行为配置等。
+ */
 export interface RaydiumLoadParams extends TokenAccountDataProp, Omit<RaydiumApiBatchRequestParams, "api"> {
   /* ================= solana ================= */
   // solana web3 connection
@@ -67,6 +89,15 @@ interface ApiData {
   jupTokenList?: DataBase<ApiV3Token[]>;
 }
 
+/**
+ * Raydium 主类：聚合各业务模块并维护全局上下文与缓存。
+ *
+ * 职责：
+ * - 通过构造函数注入 `connection`、`cluster`、`api` 等依赖
+ * - 实例化模块：`account`、`liquidity`、`clmm`、`cpmm`、`tradeV2`、`token`、`farm`、`launchpad`、`marketV2`、`ido` 等
+ * - 提供公共数据与能力：链上时间/偏移、纪元信息、功能可用性检查、代币列表（Raydium/Jupiter）缓存
+ * - 统一 owner/connection/signAllTransactions 的设置与切换
+ */
 export class Raydium {
   public cluster: Cluster;
   public farm: Farm;
@@ -104,6 +135,9 @@ export class Raydium {
     value: EpochInfo;
   };
 
+  /**
+   * 构造函数：注入依赖并实例化所有子模块。
+   */
   constructor(config: RaydiumConstructorParams) {
     const {
       connection,
@@ -134,13 +168,21 @@ export class Raydium {
       tokenAccounts: config.tokenAccounts,
       tokenAccountRawInfos: config.tokenAccountRawInfos,
     });
+    // 标准池（AMM）与稳定池的增删查等能力
     this.liquidity = new Liquidity({ scope: this, moduleName: "Raydium_LiquidityV2" });
+    // 代币模块：加载代币列表、元信息解析与工具函数
     this.token = new TokenModule({ scope: this, moduleName: "Raydium_tokenV2" });
+    // 路由和交易撮合（V2）
     this.tradeV2 = new TradeV2({ scope: this, moduleName: "Raydium_tradeV2" });
+    // 集中流动性做市（CLMM）模块
     this.clmm = new Clmm({ scope: this, moduleName: "Raydium_clmm" });
+    // 恒定乘积做市（CPMM）模块
     this.cpmm = new Cpmm({ scope: this, moduleName: "Raydium_cpmm" });
+    // 常用工具集合（签名、交易、辅助计算等）
     this.utils1216 = new Utils1216({ scope: this, moduleName: "Raydium_utils1216" });
+    // 市场（如订单簿创建等）
     this.marketV2 = new MarketV2({ scope: this, moduleName: "Raydium_marketV2" });
+    // Ido/Launchpad 场景相关能力
     this.ido = new Ido({ scope: this, moduleName: "Raydium_ido" });
     this.launchpad = new Launchpad({ scope: this, moduleName: "Raydium_lauchpad" });
 
@@ -158,6 +200,12 @@ export class Raydium {
       };
   }
 
+  /**
+   * 一站式创建并初始化 Raydium 实例：
+   * - 构建内部 API 客户端
+   * - 预拉取功能可用性
+   * - 可选：预加载 token 列表（含 Jupiter）
+   */
   static async load(config: RaydiumLoadParams): Promise<Raydium> {
     const custom: Required<RaydiumLoadParams> = merge(
       // default
@@ -214,6 +262,9 @@ export class Raydium {
     return this;
   }
 
+  /**
+   * 校验是否已设置 owner。未设置时抛错。
+   */
   public checkOwner(): void {
     if (!this.owner) {
       console.error(EMPTY_OWNER);
@@ -221,10 +272,16 @@ export class Raydium {
     }
   }
 
+  /**
+   * 判断缓存是否失效（基于 `_apiCacheTime`）。
+   */
   private isCacheInvalidate(time: number): boolean {
     return new Date().getTime() - time > this._apiCacheTime;
   }
 
+  /**
+   * 从 API 获取链上时间偏移量并缓存。
+   */
   public async fetchChainTime(): Promise<void> {
     try {
       const data = await this.api.getChainTimeOffset();
@@ -240,6 +297,9 @@ export class Raydium {
     }
   }
 
+  /**
+   * 获取 Raydium Token 列表（带缓存，可通过 `forceUpdate` 强制刷新）。
+   */
   public async fetchV3TokenList(forceUpdate?: boolean): Promise<ApiV3TokenRes> {
     if (this.apiData.tokenList && !this.isCacheInvalidate(this.apiData.tokenList.fetched) && !forceUpdate)
       return this.apiData.tokenList.data;
@@ -262,6 +322,9 @@ export class Raydium {
     }
   }
 
+  /**
+   * 获取 Jupiter Token 列表（带缓存，可通过 `forceUpdate` 强制刷新）。
+   */
   public async fetchJupTokenList(forceUpdate?: boolean): Promise<ApiV3Token[]> {
     if (this.cluster === "devnet") return [];
     const prevFetched = this.apiData.jupTokenList;
@@ -289,12 +352,18 @@ export class Raydium {
     return this._chainTime?.value;
   }
 
+  /**
+   * 返回链上时间偏移量（毫秒）。缓存 5 分钟。
+   */
   public async chainTimeOffset(): Promise<number> {
     if (this._chainTime && Date.now() - this._chainTime.fetched <= 1000 * 60 * 5) return this._chainTime.value.offset;
     await this.fetchChainTime();
     return this._chainTime?.value.offset || 0;
   }
 
+  /**
+   * 返回当前链上时间（毫秒）。缓存 5 分钟。
+   */
   public async currentBlockChainTime(): Promise<number> {
     if (this._chainTime && Date.now() - this._chainTime.fetched <= 1000 * 60 * 5)
       return this._chainTime.value.chainTime;
@@ -302,6 +371,9 @@ export class Raydium {
     return this._chainTime?.value.chainTime || Date.now();
   }
 
+  /**
+   * 获取 Solana 纪元信息（缓存 30 秒）。
+   */
   public async fetchEpochInfo(): Promise<EpochInfo> {
     if (this._epochInfo && Date.now() - this._epochInfo.fetched <= 1000 * 30) return this._epochInfo.value;
     this._epochInfo = {
@@ -311,6 +383,11 @@ export class Raydium {
     return this._epochInfo.value;
   }
 
+  /**
+   * 从 API 拉取功能可用性。
+   * - 若 `skipCheck` 为 true，返回空对象并跳过请求。
+   * - 若 `all` 为 false，则细分功能均视为不可用。
+   */
   public async fetchAvailabilityStatus(skipCheck?: boolean): Promise<Partial<AvailabilityCheckAPI3>> {
     if (skipCheck) return {};
     try {

@@ -1,3 +1,17 @@
+/*
+  文件概览：CLMM 池计算与数据工具集（pool utils）
+
+  作用：
+  - 提供集中式流动性相关的核心计算与数据装配：
+    - 交换路径与剩余账户计算（remaining accounts）
+    - 给定输入/输出的撮合结果估算（AmountOut/AmountIn）与滑点、价格影响
+    - TickArray 初始化检测、相邻搜索、位图扩展（ExBitmap）解析
+    - 奖励信息的链上时间推进（remaining、growth、emission）
+    - 从 RPC 批量拉取池状态并组装为 `ComputeClmmPoolInfo`
+    - TVL/APR 估算与提供/回收流动性所需 Token 计算
+  - 为上层 `Clmm` 模块提供底层支撑，屏蔽链上细节与复杂数学。
+*/
+
 import { Connection, EpochInfo, PublicKey } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import BN from "bn.js";
@@ -39,6 +53,10 @@ import { TickArrayBitmap, TickArrayBitmapExtensionUtils } from "./tickarrayBitma
 import { TickQuery } from "./tickQuery";
 
 export class PoolUtils {
+  /**
+   * 基于输入 Token 与数量，计算预期输出值与执行所需的 `remainingAccounts`。
+   * 会根据撮合方向定位第一组已初始化 TickArray，并动态拓展需要的账户列表。
+   */
   public static getOutputAmountAndRemainAccounts(
     poolInfo: ComputeClmmPoolInfo,
     tickArrayCache: { [key: string]: TickArray },
@@ -109,6 +127,7 @@ export class PoolUtils {
     };
   }
 
+  /** 基于目标输出 Token 与数量，反推所需输入与 `remainingAccounts`。 */
   public static getInputAmountAndRemainAccounts(
     poolInfo: ComputeClmmPoolInfo,
     tickArrayCache: { [key: string]: TickArray },
@@ -162,6 +181,10 @@ export class PoolUtils {
     return { expectedAmountIn: inputAmount, remainingAccounts: allNeededAccounts, executionPrice, feeAmount };
   }
 
+  /**
+   * 获取当前价格所在或下一组已初始化的 TickArray：
+   * 若默认位图范围不足，则尝试从扩展位图（ExBitmap）中检索。
+   */
   public static getFirstInitializedTickArray(
     poolInfo: ComputeClmmPoolInfo,
     zeroForOne: boolean,
@@ -172,15 +195,15 @@ export class PoolUtils {
       poolInfo.tickCurrent,
     ])
       ? TickArrayBitmapExtensionUtils.checkTickArrayIsInit(
-        TickQuery.getArrayStartIndex(poolInfo.tickCurrent, poolInfo.tickSpacing),
-        poolInfo.tickSpacing,
-        poolInfo.exBitmapInfo,
-      )
+          TickQuery.getArrayStartIndex(poolInfo.tickCurrent, poolInfo.tickSpacing),
+          poolInfo.tickSpacing,
+          poolInfo.exBitmapInfo,
+        )
       : TickUtils.checkTickArrayIsInitialized(
-        TickUtils.mergeTickArrayBitmap(poolInfo.tickArrayBitmap),
-        poolInfo.tickCurrent,
-        poolInfo.tickSpacing,
-      );
+          TickUtils.mergeTickArrayBitmap(poolInfo.tickArrayBitmap),
+          poolInfo.tickCurrent,
+          poolInfo.tickSpacing,
+        );
 
     if (isInitialized) {
       const { publicKey: address } = getPdaTickArrayAddress(poolInfo.programId, poolInfo.id, startIndex);
@@ -206,6 +229,7 @@ export class PoolUtils {
     return { isExist: false, nextAccountMeta: undefined, startIndex: undefined };
   }
 
+  /** 尝试查找上一组已初始化 TickArray 起始索引（用于预加载路径）。 */
   public static preInitializedTickArrayStartIndex(
     poolInfo: ComputeClmmPoolInfo,
     zeroForOne: boolean,
@@ -214,31 +238,32 @@ export class PoolUtils {
 
     const result: number[] = !zeroForOne
       ? TickUtils.searchLowBitFromStart(
-        poolInfo.tickArrayBitmap,
-        poolInfo.exBitmapInfo,
-        currentOffset - 1,
-        1,
-        poolInfo.tickSpacing,
-      )
+          poolInfo.tickArrayBitmap,
+          poolInfo.exBitmapInfo,
+          currentOffset - 1,
+          1,
+          poolInfo.tickSpacing,
+        )
       : TickUtils.searchHightBitFromStart(
-        poolInfo.tickArrayBitmap,
-        poolInfo.exBitmapInfo,
-        currentOffset + 1,
-        1,
-        poolInfo.tickSpacing,
-      );
+          poolInfo.tickArrayBitmap,
+          poolInfo.exBitmapInfo,
+          currentOffset + 1,
+          1,
+          poolInfo.tickSpacing,
+        );
 
     return result.length > 0 ? { isExist: true, nextStartIndex: result[0] } : { isExist: false, nextStartIndex: 0 };
   }
 
+  /** 按方向迭代查找下一组已初始化 TickArray 起始索引，默认与扩展位图混合检索。 */
   public static nextInitializedTickArrayStartIndex(
     poolInfo:
       | {
-        tickCurrent: number;
-        tickSpacing: number;
-        tickArrayBitmap: BN[];
-        exBitmapInfo: TickArrayBitmapExtensionType;
-      }
+          tickCurrent: number;
+          tickSpacing: number;
+          tickArrayBitmap: BN[];
+          exBitmapInfo: TickArrayBitmapExtensionType;
+        }
       | ClmmPoolInfo,
     lastTickArrayStartIndex: number,
     zeroForOne: boolean,
@@ -296,6 +321,7 @@ export class PoolUtils {
     // return result.length > 0 ? { isExist: true, nextStartIndex: result[0] } : { isExist: false, nextStartIndex: 0 }
   }
 
+  /** 根据链上时间推进奖励全局累积量/已发放量，处理边界时间与 0 流动性。 */
   public static async updatePoolRewardInfos({
     connection,
     apiPoolInfo,
@@ -346,6 +372,7 @@ export class PoolUtils {
     return nRewardInfo;
   }
 
+  /** 判断 tick 起始索引是否超出默认位图边界（需用扩展位图）。 */
   public static isOverflowDefaultTickarrayBitmap(tickSpacing: number, tickarrayStartIndexs: number[]): boolean {
     const { maxTickBoundary, minTickBoundary } = this.tickRange(tickSpacing);
 
@@ -360,6 +387,7 @@ export class PoolUtils {
     return false;
   }
 
+  /** 计算默认位图的 tick 边界范围（最大/最小起始索引）。 */
   public static tickRange(tickSpacing: number): {
     maxTickBoundary: number;
     minTickBoundary: number;
@@ -376,6 +404,7 @@ export class PoolUtils {
     return { maxTickBoundary, minTickBoundary };
   }
 
+  /** 计算某 tickArray 起始索引在位图中的偏移量。 */
   public static get_tick_array_offset(tickarrayStartIndex: number, tickSpacing: number): number {
     if (!TickQuery.checkIsValidStartIndex(tickarrayStartIndex, tickSpacing)) {
       throw new Error("No enough initialized tickArray");
@@ -384,6 +413,7 @@ export class PoolUtils {
     return (tickarrayStartIndex / TickQuery.tickCount(tickSpacing)) * TICK_ARRAY_BITMAP_SIZE;
   }
 
+  /** 批量获取扩展位图账户并解码为 `TickArrayBitmapExtensionLayout`。 */
   static async fetchExBitmaps({
     connection,
     exBitmapAddress,
@@ -463,6 +493,7 @@ export class PoolUtils {
   }
 
   // deprecated, new api doesn't need
+  /** 已废弃：旧版 API 拉取用户在多个池的仓位与奖励信息。 */
   static async fetchPoolsAccountPosition({
     pools,
     connection,
@@ -616,6 +647,7 @@ export class PoolUtils {
     return pools;
   }
 
+  /** 估算 Base-In 交换（考虑 2022 费用、滑点、执行价格/影响，返回剩余账户）。 */
   static computeAmountOut({
     poolInfo,
     tickArrayCache,
@@ -708,6 +740,7 @@ export class PoolUtils {
     };
   }
 
+  /** 估算 Base-In 并格式化为更上层友好的结构。 */
   static computeAmountOutFormat({
     poolInfo,
     tickArrayCache,
@@ -808,6 +841,7 @@ export class PoolUtils {
     };
   }
 
+  /** 估算 Base-Out 交换（目标输出反推最大输入）。 */
   static computeAmountIn({
     poolInfo,
     tickArrayCache,
@@ -910,6 +944,7 @@ export class PoolUtils {
     };
   }
 
+  /** 基于价格区间与池面 APR 统计粗略估算用户 APR（区间重叠比例）。 */
   static estimateAprsForPriceRangeMultiplier({
     poolInfo,
     aprType,
@@ -961,6 +996,7 @@ export class PoolUtils {
     };
   }
 
+  /** 基于 TVL、token 价格、奖励速率的细化 APR 估算。 */
   static estimateAprsForPriceRangeDelta({
     poolInfo,
     poolLiquidity,
@@ -1071,6 +1107,7 @@ export class PoolUtils {
     };
   }
 
+  /** 从单侧 Token 输入金额推导流动性与双边实际消耗（考虑费用与滑点）。 */
   static async getLiquidityAmountOutFromAmountIn({
     poolInfo,
     inputA,
@@ -1108,7 +1145,7 @@ export class PoolUtils {
       !amountHasFee,
     );
     const _amount = new BN(
-      new Decimal(addFeeAmount.amount.sub(addFeeAmount.fee ?? ZERO).toString()).toFixed(0) // .mul(coefficient).toFixed(0),
+      new Decimal(addFeeAmount.amount.sub(addFeeAmount.fee ?? ZERO).toString()).toFixed(0), // .mul(coefficient).toFixed(0),
     );
 
     let liquidity: BN;
@@ -1142,9 +1179,10 @@ export class PoolUtils {
       amountSlippageA: inputA ? addFeeAmount : amountFromLiquidity.amountSlippageA,
       amountSlippageB: inputA ? amountFromLiquidity.amountSlippageB : addFeeAmount,
       expirationTime: amountFromLiquidity.expirationTime,
-    }
+    };
   }
 
+  /** 从给定流动性推导所需 Token A/B 数量（考虑费用、滑点与价格位置）。 */
   static async getAmountsFromLiquidity({
     epochInfo,
     poolInfo,
@@ -1203,6 +1241,7 @@ export class PoolUtils {
     };
   }
 
+  /** 批量拉取并装配多个池的运行时信息。 */
   static async fetchComputeMultipleClmmInfo({
     connection,
     poolList,
@@ -1256,6 +1295,7 @@ export class PoolUtils {
     );
   }
 
+  /** 拉取并装配单个池的运行时信息（便捷封装）。 */
   static async fetchComputeClmmInfo({
     connection,
     poolInfo,
@@ -1275,6 +1315,7 @@ export class PoolUtils {
   }
 }
 
+/** 由双边 Token 数量反算流动性与实际消耗（考虑费用与滑点）。 */
 export function getLiquidityFromAmounts({
   poolInfo,
   tickLower,
@@ -1342,6 +1383,7 @@ const mockRewardData = {
   rewardApr: [],
 };
 
+/** 将 `ComputeClmmPoolInfo` 转成对外 API 风格的 `ApiV3PoolInfoConcentratedItem`。 */
 export function clmmComputeInfoToApiInfo(pool: ComputeClmmPoolInfo): ApiV3PoolInfoConcentratedItem {
   return {
     ...pool,

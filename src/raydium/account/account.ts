@@ -1,3 +1,18 @@
+/*
+  文件概览：账户模块（Account）
+
+  作用：
+  - 维护并缓存用户的钱包代币账户列表（含 SPL Token 与 Token-2022）。
+  - 提供查询/创建关联代币账户（ATA）、创建临时 WSOL 账户、转账与账户关闭等指令拼装能力。
+  - 支持账户变更监听（可选），在监听模式下自动刷新本地缓存并回调订阅者。
+
+  关键能力：
+  - fetchWalletTokenAccounts：批量拉取并缓存用户代币账户（含 2022），带简单失效策略。
+  - getAssociatedTokenAccount：计算用户某个 mint 的 ATA 地址。
+  - getCreatedTokenAccount / getOrCreateTokenAccount：查询或指令级创建代币账户，支持 WSOL 包装与自动关闭。
+  - handleTokenAccount / processTokenAccount：根据业务侧需要，生成一组可直接加入交易的指令（含可选 Close）。
+*/
+
 import { Commitment, PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
 import { BigNumberish, getATAAddress, InstructionType, WSOLMint } from "@/common";
 import {
@@ -18,11 +33,20 @@ import {
 import { GetOrCreateTokenAccountParams, HandleTokenAccountParams, TokenAccount, TokenAccountRaw } from "./types";
 import { generatePubKey, parseTokenAccountResp } from "./util";
 
+/**
+ * 用于初始化或外部更新账户缓存的数据结构。
+ * - tokenAccounts：SDK 规整后的账户对象列表
+ * - tokenAccountRawInfos：链上返回的原始账户结构（已解析）
+ * - notSubscribeAccountChange：是否关闭账户变更订阅（默认 true 关闭订阅）
+ */
 export interface TokenAccountDataProp {
   tokenAccounts?: TokenAccount[];
   tokenAccountRawInfos?: TokenAccountRaw[];
   notSubscribeAccountChange?: boolean;
 }
+/**
+ * 账户模块主类：维护用户代币账户缓存，封装账户创建/处理相关指令。
+ */
 export default class Account extends ModuleBase {
   private _tokenAccounts: TokenAccount[] = [];
   private _tokenAccountRawInfos: TokenAccountRaw[] = [];
@@ -32,6 +56,11 @@ export default class Account extends ModuleBase {
   private _notSubscribeAccountChange = false;
   private _accountFetchTime = 0;
 
+  /**
+   * 构造函数
+   * - 支持从外部直接注入账户缓存（设置后视为“由客户端维护”，SDK 不会重置）
+   * - 支持关闭账户变更订阅（默认关闭以减少 WS 压力）
+   */
   constructor(params: TokenAccountDataProp & ModuleBaseProps) {
     super(params);
     const { tokenAccounts, tokenAccountRawInfos, notSubscribeAccountChange } = params;
@@ -41,17 +70,23 @@ export default class Account extends ModuleBase {
     this._clientOwnedToken = !!(tokenAccounts || tokenAccountRawInfos);
   }
 
+  /** 返回规整后的代币账户列表 */
   get tokenAccounts(): TokenAccount[] {
     return this._tokenAccounts;
   }
+  /** 返回原始代币账户信息列表 */
   get tokenAccountRawInfos(): TokenAccountRaw[] {
     return this._tokenAccountRawInfos;
   }
 
+  /** 设置是否订阅账户变更（true 表示不订阅） */
   set notSubscribeAccountChange(subscribe: boolean) {
     this._notSubscribeAccountChange = subscribe;
   }
 
+  /**
+   * 外部更新账户缓存并移除现有的订阅监听。
+   */
   public updateTokenAccount({ tokenAccounts, tokenAccountRawInfos }: TokenAccountDataProp): Account {
     if (tokenAccounts) this._tokenAccounts = tokenAccounts;
     if (tokenAccountRawInfos) this._tokenAccountRawInfos = tokenAccountRawInfos;
@@ -61,26 +96,35 @@ export default class Account extends ModuleBase {
     return this;
   }
 
+  /** 添加账户变更回调 */
   public addAccountChangeListener(cbk: (data: TokenAccountDataProp) => void): Account {
     this._accountListener.push(cbk);
     return this;
   }
 
+  /** 移除账户变更回调 */
   public removeAccountChangeListener(cbk: (data: TokenAccountDataProp) => void): Account {
     this._accountListener = this._accountListener.filter((listener) => listener !== cbk);
     return this;
   }
 
+  /** 计算某个 mint 的关联代币账户（ATA）地址 */
   public getAssociatedTokenAccount(mint: PublicKey, programId?: PublicKey): PublicKey {
     return getATAAddress(this.scope.ownerPubKey, mint, programId).publicKey;
   }
 
+  /** 当账户由 SDK 维护时，重置本地缓存（若由客户端维护则跳过） */
   public resetTokenAccounts(): void {
     if (this._clientOwnedToken) return;
     this._tokenAccounts = [];
     this._tokenAccountRawInfos = [];
   }
 
+  /**
+   * 拉取并缓存钱包代币账户（含 Token-2022），带简单失效策略：
+   * - 默认不订阅变更：缓存 5 秒
+   * - 订阅变更开启：缓存 3 分钟
+   */
   public async fetchWalletTokenAccounts(config?: { forceUpdate?: boolean; commitment?: Commitment }): Promise<{
     tokenAccounts: TokenAccount[];
     tokenAccountRawInfos: TokenAccountRaw[];
@@ -146,12 +190,18 @@ export default class Account extends ModuleBase {
     return { tokenAccounts, tokenAccountRawInfos };
   }
 
+  /** 清理账户变更监听器（如已注册） */
   public clearAccountChangeCkb(): void {
     if (this._accountChangeListenerId !== undefined)
       this.scope.connection.removeAccountChangeListener(this._accountChangeListenerId);
   }
 
   // user token account needed, old _selectTokenAccount
+  /**
+   * 查询已创建的代币账户：
+   * - 优先返回余额更高的账户
+   * - `associatedOnly` 为 true 时仅返回 ATA
+   */
   public async getCreatedTokenAccount({
     mint,
     programId = TOKEN_PROGRAM_ID,
@@ -177,6 +227,12 @@ export default class Account extends ModuleBase {
   }
 
   // old _selectOrCreateTokenAccount
+  /**
+   * 查询或构建“创建代币账户”的指令：
+   * - `associatedOnly` 为 true 时仅创建 ATA
+   * - 支持 WSOL 包装（创建、转入、可选关闭）
+   * - 返回创建后的账户地址与需加入交易的指令集合
+   */
   public async getOrCreateTokenAccount(params: GetOrCreateTokenAccountParams): Promise<{
     account?: PublicKey;
     instructionParams?: AddInstructionParam;
@@ -356,6 +412,11 @@ export default class Account extends ModuleBase {
   }
 
   // old _handleTokenAccount
+  /**
+   * 根据场景生成处理代币账户的指令（创建 ATA / 创建临时 WSOL 等）。
+   * - side: in/out 表示转入/转出场景影响检查逻辑
+   * - checkCreateATAOwner: 可选链上校验，确保 ATA 归属与 mint 一致
+   */
   public async handleTokenAccount(
     params: HandleTokenAccountParams,
   ): Promise<AddInstructionParam & { tokenAccount: PublicKey }> {
@@ -419,6 +480,11 @@ export default class Account extends ModuleBase {
     return { tokenAccount };
   }
 
+  /**
+   * 处理代币账户的便捷方法：
+   * - 优先使用已有账户；若需要时再拼装创建/包装 WSOL 等指令
+   * - 返回 tokenAccount 与可直接加入交易构建器的指令集合
+   */
   public async processTokenAccount(props: {
     mint: PublicKey;
     programId?: PublicKey;
